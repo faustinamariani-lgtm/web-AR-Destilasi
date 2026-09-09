@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>WebAR Distilasi</title>
+
+<!-- Three.js: the same 3D engine used by the original simulation -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.146.0/build/three.min.js"></script>
+
+<!-- AR.js / ARToolkit for image-marker tracking -->
+<script src="https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.5/three.js/build/ar-threex.js"></script>
+
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin:0; width:100%; height:100%; overflow:hidden; background:transparent; font-family:Arial,sans-serif; }
+  #ar-container { position:fixed; inset:0; overflow:hidden; background:#000; }
+  #ar-container video { position:fixed !important; inset:0 !important; width:100% !important; height:100% !important; object-fit:cover !important; z-index:0; }
+  #ar-canvas { position:fixed; inset:0; width:100%; height:100%; z-index:1; pointer-events:none; }
+  #ui {
+    position:fixed; left:12px; right:12px; bottom:12px; z-index:10;
+    padding:12px; border-radius:16px; color:#fff;
+    background:rgba(10,18,30,.78); backdrop-filter:blur(10px);
+    box-shadow:0 8px 30px rgba(0,0,0,.25);
+  }
+  #topbar { position:fixed; top:12px; left:12px; right:12px; z-index:10; display:flex; gap:8px; align-items:center; }
+  .badge { padding:8px 12px; border-radius:999px; background:rgba(10,18,30,.78); color:#fff; font-size:13px; }
+  #status { font-size:13px; margin-bottom:8px; }
+  #tempRow { display:flex; gap:8px; align-items:center; }
+  #temp { flex:1; }
+  button {
+    border:0; border-radius:10px; padding:9px 12px; font-weight:700;
+    background:#fff; color:#16304a; cursor:pointer;
+  }
+  button.active { background:#ffd166; }
+  input[type=range] { width:100%; }
+  .hint { font-size:11px; opacity:.78; margin-top:7px; line-height:1.35; }
+  #permission {
+    position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center;
+    padding:24px; background:rgba(0,0,0,.72); color:#fff; text-align:center;
+  }
+  #permissionCard { max-width:360px; padding:22px; border-radius:18px; background:#162235; }
+  #startAR { margin-top:14px; width:100%; }
+</style>
+</head>
+
+<body>
+<div id="ar-container"></div>
+
+<div id="topbar">
+  <div class="badge" id="tracking">🔎 Arahkan kamera ke marker Hiro</div>
+</div>
+
+<div id="ui">
+  <div id="status">Suhu: 25°C · Idle (25°C)</div>
+  <div id="tempRow">
+    <input id="temp" type="range" min="25" max="110" step="1" value="25">
+    <button id="heatBtn">🔥 Pemanasan</button>
+    <button id="coolBtn" class="active">💧 Pendingin</button>
+    <button id="resetBtn">Reset</button>
+  </div>
+  <div class="hint">
+    WebAR ini menggunakan marker Hiro untuk pengujian. Untuk marker/gambar milik aplikasi Anda,
+    ganti nilai MARKER_URL pada JavaScript dengan file <b>.patt</b> hasil marker training.
+  </div>
+</div>
+
+<div id="permission">
+  <div id="permissionCard">
+    <h2 style="margin-top:0">WebAR Distilasi</h2>
+    <p>Izinkan akses kamera, lalu arahkan kamera HP ke marker Hiro.</p>
+    <button id="startAR">Mulai Kamera AR</button>
+  </div>
+</div>
+
+<script>
+const MARKER_URL = "https://raw.githubusercontent.com/AR-js-org/AR.js/master/three.js/examples/marker-training/examples/hiro.patt";
+
+const state = {
+  temp: 25,
+  heat: false,
+  cooling: true,
+  liquidLevelDistill: 100,
+  liquidLevelReceive: 0,
+  vaporIntensity: 0,
+  isBoiling: false
+};
+
+const tempInput = document.getElementById("temp");
+const heatBtn = document.getElementById("heatBtn");
+const coolBtn = document.getElementById("coolBtn");
+const resetBtn = document.getElementById("resetBtn");
+const statusEl = document.getElementById("status");
+const trackingEl = document.getElementById("tracking");
+const permissionEl = document.getElementById("permission");
+
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+function lerp(a, b, t) { return a * (1 - t) + b * t; }
+
+function updateStatus(tempText, stateText) {
+  statusEl.textContent = `Suhu: ${tempText} · ${stateText}`;
+}
+
+tempInput.addEventListener("input", () => {
+  state.temp = Number(tempInput.value);
+});
+heatBtn.addEventListener("click", () => {
+  state.heat = !state.heat;
+  heatBtn.classList.toggle("active", state.heat);
+});
+coolBtn.addEventListener("click", () => {
+  state.cooling = !state.cooling;
+  coolBtn.classList.toggle("active", state.cooling);
+});
+resetBtn.addEventListener("click", () => {
+  state.temp = 25;
+  state.heat = false;
+  state.cooling = true;
+  state.liquidLevelDistill = 100;
+  state.liquidLevelReceive = 0;
+  state.vaporIntensity = 0;
+  state.isBoiling = false;
+  tempInput.value = 25;
+  heatBtn.classList.remove("active");
+  coolBtn.classList.add("active");
+  updateStatus("25°C", "Idle (25°C)");
+});
+
+let scene, camera, renderer, arSource, arContext, markerControls, arRoot;
+let updateSimulation;
+let arReady = false;
+
+function initAR() {
+  scene = new THREE.Scene();
+  camera = new THREE.Camera();
+  scene.add(camera);
+
+  renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.domElement.id = "ar-canvas";
+  document.getElementById("ar-container").appendChild(renderer.domElement);
+
+  arSource = new THREEx.ArToolkitSource({
+    sourceType: "webcam",
+    sourceWidth: 1280,
+    sourceHeight: 720,
+    displayWidth: window.innerWidth,
+    displayHeight: window.innerHeight
+  });
+
+  arContext = new THREEx.ArToolkitContext({
+    cameraParametersUrl:
+      "https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.5/three.js/data/camera_para.dat",
+    detectionMode: "mono",
+    maxDetectionRate: 60,
+    canvasWidth: 640,
+    canvasHeight: 480
+  });
+
+  arSource.init(() => {
+    onResizeAR();
+    permissionEl.style.display = "none";
+  });
+
+  arContext.init(() => {
+    camera.projectionMatrix.copy(arContext.getProjectionMatrix());
+  });
+
+  markerControls = new THREEx.ArMarkerControls(arContext, camera, {
+    type: "pattern",
+    patternUrl: MARKER_URL,
+    changeMatrixMode: "cameraTransformMatrix",
+    smooth: true,
+    smoothCount: 10,
+    smoothTolerance: 0.01,
+    smoothThreshold: 5
+  });
+
+  markerControls.addEventListener("markerFound", () => {
+    trackingEl.textContent = "✅ Marker terdeteksi — objek 3D aktif";
+  });
+  markerControls.addEventListener("markerLost", () => {
+    trackingEl.textContent = "🔎 Arahkan kamera ke marker Hiro";
+  });
+
+  // Build the original distillation apparatus only after the AR scene exists.
+  buildDistillationScene();
+
+  arReady = true;
+  window.addEventListener("resize", onResizeAR);
+  requestAnimationFrame(renderAR);
+}
+
+function onResizeAR() {
+  if (!arSource) return;
+  arSource.onResizeElement();
+  arSource.copyElementSizeTo(renderer.domElement);
+  if (arContext && arContext.arController) {
+    arSource.copyElementSizeTo(arContext.arController.canvas);
+  }
+  renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+function renderAR(now) {
+  requestAnimationFrame(renderAR);
+  if (!arReady || !arSource.ready) return;
+
+  arContext.update(arSource.domElement);
+
+  if (updateSimulation) {
+    const current = now * 0.001;
+    const dt = Math.min(0.05, (renderAR.lastTime ? current - renderAR.lastTime : 0.016));
+    renderAR.lastTime = current;
+    updateSimulation({ time: current, dt, state });
+    tempInput.value = Math.round(state.temp);
+  }
+
+  renderer.render(scene, camera);
+}
+
+document.getElementById("startAR").addEventListener("click", () => {
+  try {
+    initAR();
+  } catch (err) {
+    console.error(err);
+    trackingEl.textContent = "⚠️ AR gagal dimulai. Pastikan halaman dibuka melalui HTTPS/localhost.";
+    permissionEl.style.display = "none";
+  }
+});
+</script>
+
+<script>
+/*
+ * Bagian di bawah ini adalah visualisasi Three.js asli dari file Anda.
+ * Adaptasi AR.js:
+ * 1) seluruh objek dimasukkan ke arRoot;
+ * 2) arRoot diskalakan agar cocok di atas marker;
+ * 3) loop update dipanggil dari renderAR();
+ */
+function buildDistillationScene() {
+  arRoot = new THREE.Group();
+  arRoot.scale.setScalar(0.022);
+  scene.add(arRoot);
+  // Lighting
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.75);
+  arRoot.add(ambientLight);
+
+  const dirLight1 = new THREE.DirectionalLight(0xffffff, 0.9);
+  dirLight1.position.set(25, 35, 25);
+  arRoot.add(dirLight1);
+
+  const dirLight2 = new THREE.DirectionalLight(0x80b0ff, 0.4);
+  dirLight2.position.set(-20, -10, -15);
+  arRoot.add(dirLight2);
+
+  // Materials
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0xe6f7ff,
+    transparent: true,
+    opacity: 0.32,
+    roughness: 0.08,
+    metalness: 0.1
+  });
+
+  const metalMat = new THREE.MeshStandardMaterial({
+    color: 0x888894,
+    metalness: 0.85,
+    roughness: 0.25
+  });
+
+  const benchMat = new THREE.MeshStandardMaterial({
+    color: 0x1a1c23,
+    roughness: 0.6,
+    metalness: 0.1
+  });
+
+  const mantleMat = new THREE.MeshStandardMaterial({
+    color: 0x33333d,
+    roughness: 0.7
+  });
+
+  const heaterGlowMat = new THREE.MeshStandardMaterial({
+    color: 0xff3300,
+    emissive: 0x000000,
+    roughness: 0.4
+  });
+
+  const liquidDistillMat = new THREE.MeshStandardMaterial({
+    color: 0xee9922,
+    transparent: true,
+    opacity: 0.8,
+    roughness: 0.2
+  });
+
+  const liquidReceiveMat = new THREE.MeshStandardMaterial({
+    color: 0x22ccff,
+    transparent: true,
+    opacity: 0.85,
+    roughness: 0.15
+  });
+
+  const waterJacketMat = new THREE.MeshStandardMaterial({
+    color: 0x55d0ff,
+    transparent: true,
+    opacity: 0.22,
+    roughness: 0.1
+  });
+
+  // Lab Bench Base Surface
+  const bench = new THREE.Mesh(new THREE.BoxGeometry(50, 0.6, 20), benchMat);
+  bench.position.set(0, -9.3, 0);
+  arRoot.add(bench);
+
+  // --- SUPPORT STANDS ---
+  function createStand(xPos) {
+    const group = new THREE.Group();
+    const base = new THREE.Mesh(new THREE.BoxGeometry(6, 0.4, 9), metalMat);
+    base.position.set(xPos, -9, 0);
+    group.add(base);
+
+    const rod = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 26, 16), metalMat);
+    rod.position.set(xPos - 2, 4, -3);
+    group.add(rod);
+
+    return group;
+  }
+  arRoot.add(createStand(-15));
+  arRoot.add(createStand(8));
+
+  // --- HEATING MANTLE (LEFT, x = -15) ---
+  const mantleGroup = new THREE.Group();
+  mantleGroup.position.set(-15, -6, 0);
+
+  const mantleOuter = new THREE.Mesh(new THREE.CylinderGeometry(5.2, 4.8, 4.5, 32), mantleMat);
+  mantleGroup.add(mantleOuter);
+
+  const heaterElement = new THREE.Mesh(new THREE.SphereGeometry(4.3, 32, 16, 0, Math.PI * 2, Math.PI * 0.5, Math.PI * 0.5), heaterGlowMat);
+  heaterElement.position.y = 0.2;
+  mantleGroup.add(heaterElement);
+  arRoot.add(mantleGroup);
+
+  // --- DISTILLATION FLASK (LEFT, x = -15) ---
+  const distillFlaskGroup = new THREE.Group();
+  distillFlaskGroup.position.set(-15, 0, 0);
+
+  const flaskBulb = new THREE.Mesh(new THREE.SphereGeometry(4.5, 32, 32), glassMat);
+  distillFlaskGroup.add(flaskBulb);
+
+  const flaskNeck = new THREE.Mesh(new THREE.CylinderGeometry(1.0, 1.0, 7.5, 32), glassMat);
+  flaskNeck.position.y = 6.25;
+  distillFlaskGroup.add(flaskNeck);
+
+  // Distillation Liquid
+  const distillLiquidMesh = new THREE.Mesh(new THREE.SphereGeometry(4.2, 32, 16, 0, Math.PI * 2, Math.PI * 0.5, Math.PI * 0.5), liquidDistillMat);
+  distillLiquidMesh.position.y = -0.1;
+  distillFlaskGroup.add(distillLiquidMesh);
+
+  arRoot.add(distillFlaskGroup);
+
+  // Clamps holding Left Flask
+  const clampLeft = new THREE.Mesh(new THREE.CylinderGeometry(1.2, 1.2, 0.4, 16, 1, true), metalMat);
+  clampLeft.position.set(-15, 5, 0);
+  arRoot.add(clampLeft);
+
+  const clampArmLeft = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 3.5, 8), metalMat);
+  clampArmLeft.rotation.z = Math.PI / 2;
+  clampArmLeft.position.set(-16.5, 5, -1.5);
+  arRoot.add(clampArmLeft);
+
+  // --- THERMOMETER & STILL HEAD ---
+  const thermoGroup = new THREE.Group();
+  thermoGroup.position.set(-15, 10, 0);
+
+  const thermoGlass = new THREE.Mesh(new THREE.CylinderGeometry(0.25, 0.25, 7, 16), glassMat);
+  thermoGlass.position.y = 2;
+  thermoGroup.add(thermoGlass);
+
+  const thermoMercury = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.1, 0.1, 5, 16),
+    new THREE.MeshStandardMaterial({ color: 0xff0033, roughness: 0.2 })
+  );
+  thermoMercury.position.y = 1;
+  thermoGroup.add(thermoMercury);
+
+  arRoot.add(thermoGroup);
+
+  // --- LIEBIG CONDENSER ---
+  // Condenser vector: P1 = (-15, 8.5, 0) to P2 = (9, 1.0, 0)
+  const P1 = new THREE.Vector3(-15, 8.5, 0);
+  const P2 = new THREE.Vector3(9, 1.0, 0);
+  const dir = new THREE.Vector3().subVectors(P2, P1);
+  const len = dir.length();
+  const midPoint = new THREE.Vector3().addVectors(P1, P2).multiplyScalar(0.5);
+
+  const condenserGroup = new THREE.Group();
+  condenserGroup.position.copy(midPoint);
+
+  // Orient group along vector
+  const defaultDir = new THREE.Vector3(0, 1, 0);
+  const quat = new THREE.Quaternion().setFromUnitVectors(defaultDir, dir.clone().normalize());
+  condenserGroup.quaternion.copy(quat);
+
+  // Inner Condenser Tube
+  const innerCondenser = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 0.5, len, 24), glassMat);
+  condenserGroup.add(innerCondenser);
+
+  // Outer Cooling Water Jacket
+  const jacketLen = len * 0.75;
+  const outerJacket = new THREE.Mesh(new THREE.CylinderGeometry(1.3, 1.3, jacketLen, 24), waterJacketMat);
+  condenserGroup.add(outerJacket);
+
+  // Jacket Nozzles
+  const nozzleMat = glassMat;
+  const nozzle1 = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 1.2, 12), nozzleMat);
+  nozzle1.rotation.z = Math.PI / 2;
+  nozzle1.position.set(0.8, -jacketLen * 0.4, 0);
+  condenserGroup.add(nozzle1);
+
+  const nozzle2 = new THREE.Mesh(new THREE.CylinderGeometry(0.2, 0.2, 1.2, 12), nozzleMat);
+  nozzle2.rotation.z = Math.PI / 2;
+  nozzle2.position.set(-0.8, jacketLen * 0.4, 0);
+  condenserGroup.add(nozzle2);
+
+  arRoot.add(condenserGroup);
+
+  // Clamp holding Condenser
+  const clampRight = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.5, 0.4, 16, 1, true), metalMat);
+  clampRight.position.copy(midPoint);
+  clampRight.quaternion.copy(quat);
+  arRoot.add(clampRight);
+
+  // --- RECEIVING ADAPTER & FLASK (RIGHT, x = 11) ---
+  const receiveGroup = new THREE.Group();
+  receiveGroup.position.set(11, -4.5, 0);
+
+  // Receiving Flask Body (Erlenmeyer shape)
+  const receiveFlask = new THREE.Mesh(new THREE.ConeGeometry(3.8, 6.5, 32), glassMat);
+  receiveFlask.rotation.x = Math.PI;
+  receiveGroup.add(receiveFlask);
+
+  const receiveNeck = new THREE.Mesh(new THREE.CylinderGeometry(0.8, 0.8, 2.5, 24), glassMat);
+  receiveNeck.position.y = 3.5;
+  receiveGroup.add(receiveNeck);
+
+  // Receiving Liquid
+  const receiveLiquidMesh = new THREE.Mesh(new THREE.ConeGeometry(3.6, 6.0, 32), liquidReceiveMat);
+  receiveLiquidMesh.rotation.x = Math.PI;
+  receiveLiquidMesh.position.y = -0.2;
+  receiveGroup.add(receiveLiquidMesh);
+
+  arRoot.add(receiveGroup);
+
+  // --- PARTICLE SYSTEMS ---
+
+  // 1. Boiling Bubbles inside Left Flask
+  const bubbleCount = 45;
+  const bubbleGeo = new THREE.BufferGeometry();
+  const bubblePos = new Float32Array(bubbleCount * 3);
+  for (let i = 0; i < bubbleCount; i++) {
+    bubblePos[i * 3] = (Math.random() - 0.5) * 3.2;
+    bubblePos[i * 3 + 1] = -4 + Math.random() * 3.5;
+    bubblePos[i * 3 + 2] = (Math.random() - 0.5) * 3.2;
+  }
+  bubbleGeo.setAttribute('position', new THREE.BufferAttribute(bubblePos, 3));
+  const bubbleMat = new THREE.PointsMaterial({
+    color: 0xffffff,
+    size: 0.35,
+    transparent: true,
+    opacity: 0
+  });
+  const bubbleParticles = new THREE.Points(bubbleGeo, bubbleMat);
+  distillFlaskGroup.add(bubbleParticles);
+
+  // 2. Vapor Particles (Moving along Still Head & Condenser)
+  const vaporCount = 60;
+  const vaporGeo = new THREE.BufferGeometry();
+  const vaporPos = new Float32Array(vaporCount * 3);
+  const vaporData = [];
+
+  for (let i = 0; i < vaporCount; i++) {
+    vaporPos[i * 3] = -15;
+    vaporPos[i * 3 + 1] = 0;
+    vaporPos[i * 3 + 2] = 0;
+    vaporData.push({
+      progress: Math.random(),
+      speed: 0.3 + Math.random() * 0.4,
+      offset: new THREE.Vector3((Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4, (Math.random() - 0.5) * 0.4)
+    });
+  }
+  vaporGeo.setAttribute('position', new THREE.BufferAttribute(vaporPos, 3));
+  const vaporMat = new THREE.PointsMaterial({
+    color: 0xe0f8ff,
+    size: 0.45,
+    transparent: true,
+    opacity: 0
+  });
+  const vaporParticles = new THREE.Points(vaporGeo, vaporMat);
+  arRoot.add(vaporParticles);
+
+  // 3. Condenser Cooling Water Flow Particles
+  const waterCount = 35;
+  const waterGeo = new THREE.BufferGeometry();
+  const waterPos = new Float32Array(waterCount * 3);
+  const waterData = [];
+
+  for (let i = 0; i < waterCount; i++) {
+    waterData.push({
+      t: Math.random(),
+      angle: Math.random() * Math.PI * 2,
+      radius: 0.7 + Math.random() * 0.4
+    });
+  }
+  waterGeo.setAttribute('position', new THREE.BufferAttribute(waterPos, 3));
+  const waterMat = new THREE.PointsMaterial({
+    color: 0x88eeff,
+    size: 0.3,
+    transparent: true,
+    opacity: 0.6
+  });
+  const waterParticles = new THREE.Points(waterGeo, waterMat);
+  arRoot.add(waterParticles);
+
+  // 4. Dripping Liquid Droplets into Receiving Flask
+  const dripCount = 5;
+  const dripGroup = new THREE.Group();
+  const dripMeshes = [];
+
+  for (let i = 0; i < dripCount; i++) {
+    const drip = new THREE.Mesh(
+      new THREE.SphereGeometry(0.18, 12, 12),
+      new THREE.MeshStandardMaterial({ color: 0x33ccff, roughness: 0.1, transparent: true, opacity: 0.9 })
+    );
+    drip.visible = false;
+    dripGroup.add(drip);
+    dripMeshes.push({ mesh: drip, progress: i / dripCount });
+  }
+  arRoot.add(dripGroup);
+
+  // Dynamic State Update Loop
+  let frameCount = 0;
+
+  updateSimulation = function updateSimulation({ time, dt, state }) {
+    const delta = Math.min(dt, 0.1);
+    frameCount++;
+
+    // 1. Heat / Temperature Physics Logic
+    if (state.heat) {
+      if (state.temp < 110) {
+        state.temp = Math.min(110, state.temp + delta * 9.0);
+      }
+    } else {
+      if (state.temp > 25) {
+        state.temp = Math.max(25, state.temp - delta * 4.5);
+      }
+    }
+
+    // 2. Boiling & Distillation Mass Transfer
+    const isEthanolBoiling = state.temp >= 78.3;
+    const isWaterBoiling = state.temp >= 100;
+    state.isBoiling = (isEthanolBoiling || isWaterBoiling) && state.liquidLevelDistill > 0;
+
+    if (state.isBoiling) {
+      const intensity = isWaterBoiling ? (state.temp - 95) / 15 : (state.temp - 72) / 28;
+      state.vaporIntensity = Math.min(1.0, Math.max(0.2, intensity));
+
+      if (state.cooling && state.liquidLevelDistill > 0) {
+        const transferRate = delta * 3.8 * state.vaporIntensity;
+        state.liquidLevelDistill = Math.max(0, state.liquidLevelDistill - transferRate);
+        state.liquidLevelReceive = Math.min(100, state.liquidLevelReceive + transferRate);
+      }
+    } else {
+      state.vaporIntensity = Math.max(0, state.vaporIntensity - delta * 2.5);
+    }
+
+    // 3. Update Visual Equipment & Liquid Scales
+    // Left Liquid Scale & Color Shift
+    const distillRatio = Math.max(0.001, state.liquidLevelDistill / 100);
+    distillLiquidMesh.scale.set(distillRatio, distillRatio, distillRatio);
+    distillLiquidMesh.position.y = -0.1 - 2.0 * (1 - distillRatio);
+
+    // Color transition as Ethanol boils off leaving Water
+    const ethanolRatio = state.liquidLevelDistill / 100;
+    liquidDistillMat.color.setHSL(0.08 + (1 - ethanolRatio) * 0.08, 0.8, 0.5);
+
+    // Right Liquid Scale
+    const receiveRatio = Math.max(0.001, state.liquidLevelReceive / 100);
+    receiveLiquidMesh.scale.set(receiveRatio, receiveRatio, receiveRatio);
+    receiveLiquidMesh.position.y = -3.2 + (receiveRatio * 3.0);
+
+    // Heater Mantle Glow Intensity
+    heaterGlowMat.emissive.setHex(state.heat ? 0xff2200 : 0x000000);
+    heaterGlowMat.emissiveIntensity = state.heat ? (0.7 + Math.sin(time * 12) * 0.25) : 0;
+
+    // Thermometer Mercury Column Height
+    const tempRatio = clamp((state.temp - 25) / (110 - 25), 0.05, 1.0);
+    thermoMercury.scale.y = tempRatio;
+    thermoMercury.position.y = -1.5 + tempRatio * 2.5;
+
+    // Water Jacket Opacity & Particles
+    waterJacketMat.opacity = state.cooling ? 0.28 : 0.08;
+
+    // 4. Animate Particles
+    // A. Boiling Bubbles
+    if (state.isBoiling) {
+      bubbleMat.opacity = Math.min(0.85, state.vaporIntensity * 0.9);
+      const bPos = bubbleGeo.attributes.position.array;
+      const maxY = -4 + distillRatio * 4.0;
+
+      for (let i = 0; i < bubbleCount; i++) {
+        bPos[i * 3 + 1] += delta * (2.5 + Math.sin(i));
+        if (bPos[i * 3 + 1] > maxY) {
+          bPos[i * 3 + 1] = -4.2;
+          bPos[i * 3] = (Math.random() - 0.5) * 3.0 * distillRatio;
+          bPos[i * 3 + 2] = (Math.random() - 0.5) * 3.0 * distillRatio;
+        }
+      }
+      bubbleGeo.attributes.position.needsUpdate = true;
+    } else {
+      bubbleMat.opacity = 0;
+    }
+
+    // B. Vapor Flow through Neck & Condenser
+    vaporMat.opacity = state.vaporIntensity * 0.75;
+    const vPos = vaporGeo.attributes.position.array;
+
+    for (let i = 0; i < vaporCount; i++) {
+      const vd = vaporData[i];
+      if (state.vaporIntensity > 0.05) {
+        vd.progress = (vd.progress + delta * vd.speed * state.vaporIntensity) % 1.0;
+      }
+
+      let p = new THREE.Vector3();
+      if (vd.progress < 0.3) {
+        // Stage 1: Rising in flask neck
+        const t1 = vd.progress / 0.3;
+        p.set(-15, lerp(1, 8.5, t1), 0);
+      } else if (vd.progress < 0.85) {
+        // Stage 2: Moving down Condenser tube
+        const t2 = (vd.progress - 0.3) / 0.55;
+        p.lerpVectors(P1, P2, t2);
+      } else {
+        // Stage 3: Venting or Condensing at end of tube
+        const t3 = (vd.progress - 0.85) / 0.15;
+        if (state.cooling) {
+          p.set(9 + t3 * 2, 1.0 - t3 * 2, 0);
+        } else {
+          // Vapor escapes top as steam when cooling is OFF!
+          p.set(9 + t3 * 1.5, 1.0 + t3 * 4, t3 * (Math.sin(i) * 1.5));
+        }
+      }
+
+      p.add(vd.offset);
+      vPos[i * 3] = p.x;
+      vPos[i * 3 + 1] = p.y;
+      vPos[i * 3 + 2] = p.z;
+    }
+    vaporGeo.attributes.position.needsUpdate = true;
+
+    // C. Cooling Water flow particles in jacket
+    if (state.cooling) {
+      waterMat.opacity = 0.6;
+      const wPos = waterGeo.attributes.position.array;
+      const jacketDir = dir.clone().normalize();
+      const perpX = new THREE.Vector3(0, 0, 1);
+      const perpY = new THREE.Vector3().crossVectors(jacketDir, perpX).normalize();
+
+      for (let i = 0; i < waterCount; i++) {
+        const wd = waterData[i];
+        wd.t = (wd.t + delta * 0.8) % 1.0;
+        wd.angle += delta * 3.0;
+
+        const posOnAxis = new THREE.Vector3().lerpVectors(P1, P2, 0.15 + wd.t * 0.7);
+        const offsetX = Math.cos(wd.angle) * wd.radius;
+        const offsetY = Math.sin(wd.angle) * wd.radius;
+
+        const p = posOnAxis
+          .addScaledVector(perpX, offsetX)
+          .addScaledVector(perpY, offsetY);
+
+        wPos[i * 3] = p.x;
+        wPos[i * 3 + 1] = p.y;
+        wPos[i * 3 + 2] = p.z;
+      }
+      waterGeo.attributes.position.needsUpdate = true;
+    } else {
+      waterMat.opacity = 0;
+    }
+
+    // D. Condensed Dripping Droplets into Collection Flask
+    const isDripping = state.isBoiling && state.cooling && state.liquidLevelDistill > 0;
+    dripMeshes.forEach((d) => {
+      if (isDripping) {
+        d.mesh.visible = true;
+        d.progress = (d.progress + delta * 1.4 * state.vaporIntensity) % 1.0;
+        const startDrop = new THREE.Vector3(10, 0.2, 0);
+        const endDrop = new THREE.Vector3(11, -3.5 + receiveRatio * 2.8, 0);
+
+        d.mesh.position.lerpVectors(startDrop, endDrop, d.progress);
+        d.mesh.scale.setScalar(0.7 + Math.sin(d.progress * Math.PI) * 0.5);
+      } else {
+        d.mesh.visible = false;
+      }
+    });
+
+    // 5. Decoupled Editorial Sampling (every 10 frames)
+    if (frameCount % 10 === 0) {
+      let stateLabel = "Idle (25°C)";
+      if (state.liquidLevelDistill <= 0) {
+        stateLabel = "Distillation Complete";
+      } else if (state.temp >= 100) {
+        stateLabel = "Boiling Water (100°C)";
+      } else if (state.temp >= 78.3) {
+        stateLabel = "Distilling Ethanol (78.3°C)";
+      } else if (state.heat) {
+        stateLabel = "Heating Mixture...";
+      } else if (state.temp > 25) {
+        stateLabel = "Cooling Down";
+      }
+
+      updateStatus(`${Math.round(state.temp)}°C`, stateLabel);
+    }
+  }
+}
+
+</script>
